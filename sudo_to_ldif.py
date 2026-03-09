@@ -27,8 +27,9 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 SUDO_BASE_DN = "ou=SUDOers,dc=example,dc=com"
 
 DEFAULT_HOST_ALL_THRESHOLD = 25
-GROUP_MEMBER_ATTRS = ("memberUid", "member", "uniqueMember")
-USER_NAME_ATTRS = ("uid", "sAMAccountName", "cn")
+
+# Active Directory configuration: user attributes to try for username extraction (in order of preference)
+USER_NAME_ATTRS = ("sAMAccountName", "cn", "uid")
 
 
 @dataclass(frozen=True)
@@ -96,13 +97,14 @@ class LdapGroupResolver:
             return set(self._group_cache[group_name])
 
         escaped = ldap_filter_escape(group_name)
-        filter_expr = f"(|(cn={escaped})(sAMAccountName={escaped})(gidNumber={escaped}))"
+        # Search for Active Directory groups by cn or sAMAccountName
+        filter_expr = f"(&(objectClass=group)(|(cn={escaped})(sAMAccountName={escaped})))"
 
         assert self._conn is not None
         self._conn.search(
             search_base=self._search_base,
             search_filter=filter_expr,
-            attributes=list(GROUP_MEMBER_ATTRS),
+            attributes=["member"],
             size_limit=1,
         )
 
@@ -113,19 +115,14 @@ class LdapGroupResolver:
         entry = self._conn.entries[0]
         members: Set[str] = set()
 
-        if hasattr(entry, "memberUid") and entry.memberUid:
-            members.update(str(v).strip() for v in entry.memberUid.values if str(v).strip())
-
-        dns: List[str] = []
-        for attr in ("member", "uniqueMember"):
-            if hasattr(entry, attr):
-                values = getattr(entry, attr).values
-                dns.extend(str(v).strip() for v in values if str(v).strip())
-
-        for dn in dns:
-            user_value = self._resolve_user_dn(dn)
-            if user_value:
-                members.add(user_value)
+        # Active Directory uses DN-based membership in the 'member' attribute
+        if hasattr(entry, "member") and entry.member:
+            member_dns = [str(v).strip() for v in entry.member.values if str(v).strip()]
+            
+            for dn in member_dns:
+                user_value = self._resolve_user_dn(dn)
+                if user_value:
+                    members.add(user_value)
 
         self._group_cache[group_name] = members
         return set(members)
