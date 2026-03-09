@@ -239,8 +239,14 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
     if not cleaned:
         return ParsedRule("ALL", tuple(), tuple(["ALL"]), tuple())
 
-    # Expected format (typical): "<who> <hostspec>=(<runas>) <cmdspec>"
-    match = re.match(r"^(?P<who>\S+)\s+(?P<host>\S+)\s*=\s*\((?P<runas>[^)]*)\)\s*(?P<cmd>.+)$", cleaned)
+    # Strip subject prefix if present (e.g., "root" or "%groupname")
+    # This handles cases where the CSV policy line includes the subject
+    strip_match = re.match(r"^[%]?\S+\s+(.+)$", cleaned)
+    if strip_match:
+        cleaned = strip_match.group(1)
+
+    # Expected format: "<hostspec>=(<runas>) <cmdspec>"
+    match = re.match(r"^(?P<host>\S+)\s*=\s*\((?P<runas>[^)]*)\)\s*(?P<cmd>.+)$", cleaned)
     if not match:
         # Fall back to preserving entire token stream as a single command.
         return ParsedRule("ALL", tuple(), tuple([cleaned]), tuple())
@@ -364,7 +370,7 @@ def build_ldif_entries(
         lines.append(f"cn: {cn}")
 
         for user in sorted(sudo_users):
-            lines.append(f"sudoUser: {user}")
+            lines.append(f"sudoUser: {user.lower()}")
 
         for host in sudo_hosts:
             lines.append(f"sudoHost: {host}")
