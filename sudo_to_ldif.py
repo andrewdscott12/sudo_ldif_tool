@@ -301,11 +301,20 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
     if not commands:
         commands = ["ALL"]
 
+    normalized_options = set(option_tokens)
+    # Negated options should win if both forms are present.
+    if "NOPASSWD:" in normalized_options:
+        normalized_options.discard("PASSWD:")
+    if "NOEXEC:" in normalized_options:
+        normalized_options.discard("EXEC:")
+    if "NOSETENV:" in normalized_options:
+        normalized_options.discard("SETENV:")
+
     return ParsedRule(
         host_spec=host_spec or "ALL",
         runas_users=tuple(runas_users),
         commands=tuple(commands),
-        option_tokens=tuple(sorted(set(option_tokens))),
+        option_tokens=tuple(sorted(normalized_options)),
     )
 
 
@@ -474,7 +483,15 @@ def build_ldif_entries(
         for runas_user in sorted(agg.runas_users):
             lines.append(f"sudoRunAsUser: {runas_user}")
 
-        for opt in sorted(agg.options):
+        normalized_agg_options = set(agg.options)
+        if "NOPASSWD:" in normalized_agg_options:
+            normalized_agg_options.discard("PASSWD:")
+        if "NOEXEC:" in normalized_agg_options:
+            normalized_agg_options.discard("EXEC:")
+        if "NOSETENV:" in normalized_agg_options:
+            normalized_agg_options.discard("SETENV:")
+
+        for opt in sorted(normalized_agg_options):
             translated = translate_sudo_option(opt)
             lines.append(f"sudoOption: {translated}")
 
