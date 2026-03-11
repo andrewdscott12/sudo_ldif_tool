@@ -27,7 +27,6 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 SUDO_BASE_DN = "ou=SUDOers,dc=example,dc=com"
 
 DEFAULT_HOST_ALL_THRESHOLD = 25
-GROUP_MEMBER_ATTRS = ("memberUid", "member", "uniqueMember")
 USER_NAME_ATTRS = ("uid", "sAMAccountName", "cn")
 
 
@@ -41,8 +40,8 @@ class ParsedRule:
 
 @dataclass
 class PolicyAggregate:
-    subject_type: str
-    subject_name: str
+    cn_base: str
+    sudo_users: Set[str]
     hosts: Set[str]
     commands: Set[str]
     runas_users: Set[str]
@@ -96,13 +95,14 @@ class LdapGroupResolver:
             return set(self._group_cache[group_name])
 
         escaped = ldap_filter_escape(group_name)
-        filter_expr = f"(|(cn={escaped})(sAMAccountName={escaped})(gidNumber={escaped}))"
+        # Active Directory group lookup by name.
+        filter_expr = f"(&(objectClass=group)(|(cn={escaped})(sAMAccountName={escaped})))"
 
         assert self._conn is not None
         self._conn.search(
             search_base=self._search_base,
             search_filter=filter_expr,
-            attributes=list(GROUP_MEMBER_ATTRS),
+            attributes=["member"],
             size_limit=1,
         )
 
@@ -113,14 +113,10 @@ class LdapGroupResolver:
         entry = self._conn.entries[0]
         members: Set[str] = set()
 
-        if hasattr(entry, "memberUid") and entry.memberUid:
-            members.update(str(v).strip() for v in entry.memberUid.values if str(v).strip())
-
+        # AD stores group members as user DNs in `member`.
         dns: List[str] = []
-        for attr in ("member", "uniqueMember"):
-            if hasattr(entry, attr):
-                values = getattr(entry, attr).values
-                dns.extend(str(v).strip() for v in values if str(v).strip())
+        if hasattr(entry, "member") and entry.member:
+            dns.extend(str(v).strip() for v in entry.member.values if str(v).strip())
 
         for dn in dns:
             user_value = self._resolve_user_dn(dn)
@@ -288,8 +284,17 @@ def _split_csvish_values(raw: str) -> List[str]:
     return [v for v in values if v]
 
 
-def build_policy_map(source_csv: Path) -> Dict[Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...]], PolicyAggregate]:
-    policies: Dict[Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...]], PolicyAggregate] = {}
+@dataclass(frozen=True)
+class PolicyRecord:
+    hostname: str
+    subject_type: str
+    subject_name: str
+    policyfile: str
+    parsed: ParsedRule
+
+
+def build_policy_records(source_csv: Path) -> List[PolicyRecord]:
+    records: List[PolicyRecord] = []
 
     with source_csv.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.reader(handle)
@@ -300,59 +305,123 @@ def build_policy_map(source_csv: Path) -> Dict[Tuple[str, str, str, Tuple[str, .
 
             hostname, subject_type, subject_name, policyfile, policy_line = normalized
             parsed = parse_sudo_policy_line(policy_line)
-
-            key = (
-                subject_type,
-                subject_name,
-                parsed.host_spec,
-                parsed.runas_users,
-                parsed.option_tokens,
-            )
-
-            if key not in policies:
-                policies[key] = PolicyAggregate(
+            records.append(
+                PolicyRecord(
+                    hostname=hostname,
                     subject_type=subject_type,
                     subject_name=subject_name,
-                    hosts=set(),
-                    commands=set(),
-                    runas_users=set(parsed.runas_users),
-                    options=set(parsed.option_tokens),
-                    source_files=set(),
+                    policyfile=policyfile,
+                    parsed=parsed,
                 )
+            )
 
-            agg = policies[key]
-            agg.hosts.add(hostname)
-            agg.commands.update(parsed.commands)
-            if policyfile:
-                agg.source_files.add(policyfile)
+    return records
+
+
+def _policy_file_key(policyfile: str) -> str:
+    source = policyfile.split(":", 1)[0].strip()
+    if not source:
+        return "unknown"
+    return source.rstrip("/").rsplit("/", 1)[-1] or source
+
+
+def _record_signature(record: PolicyRecord) -> Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]]:
+    return (
+        record.subject_type,
+        record.subject_name,
+        record.parsed.host_spec,
+        record.parsed.runas_users,
+        record.parsed.option_tokens,
+        tuple(sorted(record.parsed.commands)),
+    )
+
+
+def _new_aggregate(cn_base: str) -> PolicyAggregate:
+    return PolicyAggregate(
+        cn_base=cn_base,
+        sudo_users=set(),
+        hosts=set(),
+        commands=set(),
+        runas_users=set(),
+        options=set(),
+        source_files=set(),
+    )
+
+
+def build_policy_map(
+    source_csv: Path,
+    resolver: Optional[LdapGroupResolver],
+) -> Dict[str, PolicyAggregate]:
+    records = build_policy_records(source_csv)
+    policies: Dict[str, PolicyAggregate] = {}
+
+    sudoers_records = [r for r in records if _policy_file_key(r.policyfile).lower() == "sudoers"]
+    non_sudoers_records = [r for r in records if _policy_file_key(r.policyfile).lower() != "sudoers"]
+
+    sudoers_signature_hosts: Dict[Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...], Tuple[str, ...]], Set[str]] = defaultdict(set)
+    for record in sudoers_records:
+        sudoers_signature_hosts[_record_signature(record)].add(record.hostname)
+
+    # Consolidate non-/etc/sudoers content by policy file name.
+    for record in non_sudoers_records:
+        file_key = _policy_file_key(record.policyfile)
+        cn_base = f"SUDO_{sanitize_cn_component(file_key)}"
+        if cn_base not in policies:
+            policies[cn_base] = _new_aggregate(cn_base)
+
+        _merge_record_into_aggregate(policies[cn_base], record, resolver)
+
+    # /etc/sudoers: shared signatures are consolidated together.
+    # One-off signatures are grouped into SUDO_suders_<hostname>.
+    for record in sudoers_records:
+        sig_hosts = sudoers_signature_hosts[_record_signature(record)]
+        if len(sig_hosts) == 1:
+            cn_base = f"SUDO_suders_{sanitize_cn_component(record.hostname)}"
+        else:
+            cn_base = "SUDO_sudoers"
+
+        if cn_base not in policies:
+            policies[cn_base] = _new_aggregate(cn_base)
+
+        _merge_record_into_aggregate(policies[cn_base], record, resolver)
 
     return policies
 
 
+def _merge_record_into_aggregate(
+    aggregate: PolicyAggregate,
+    record: PolicyRecord,
+    resolver: Optional[LdapGroupResolver],
+) -> None:
+    sudo_users = resolve_sudo_users(record.subject_type, record.subject_name, resolver)
+    if not sudo_users:
+        sudo_users = {record.subject_name}
+
+    aggregate.sudo_users.update(sudo_users)
+    aggregate.hosts.add(record.hostname)
+    aggregate.commands.update(record.parsed.commands)
+    aggregate.runas_users.update(record.parsed.runas_users)
+    aggregate.options.update(record.parsed.option_tokens)
+    if record.policyfile:
+        aggregate.source_files.add(record.policyfile)
+
+
 def build_ldif_entries(
-    policies: Dict[Tuple[str, str, str, Tuple[str, ...], Tuple[str, ...]], PolicyAggregate],
+    policies: Dict[str, PolicyAggregate],
     base_dn: str,
     host_all_threshold: int,
-    resolver: Optional[LdapGroupResolver],
 ) -> List[str]:
     entries: List[str] = []
     cn_counts: Dict[str, int] = defaultdict(int)
 
-    for _key, agg in sorted(
-        policies.items(), key=lambda item: (item[1].subject_type, item[1].subject_name, sorted(item[1].commands))
-    ):
+    for _key, agg in sorted(policies.items(), key=lambda item: item[1].cn_base.lower()):
         commands_sorted = sorted(agg.commands)
         if not commands_sorted:
             continue
 
-        base_cn = f"SUDO_{sanitize_cn_component(commands_sorted[0])}"
+        base_cn = agg.cn_base
         cn_counts[base_cn] += 1
         cn = base_cn if cn_counts[base_cn] == 1 else f"{base_cn}_{cn_counts[base_cn]}"
-
-        sudo_users = resolve_sudo_users(agg.subject_type, agg.subject_name, resolver)
-        if not sudo_users:
-            # Keep the original subject if expansion produced no user values.
-            sudo_users = {agg.subject_name}
 
         if len(agg.hosts) > host_all_threshold:
             sudo_hosts = ["ALL"]
@@ -366,8 +435,8 @@ def build_ldif_entries(
         lines.append("objectClass: sudoRole")
         lines.append(f"cn: {cn}")
 
-        for user in sorted(sudo_users):
-            lines.append(f"sudoUser: {user}")
+        for user in sorted(agg.sudo_users):
+            lines.append(f"sudoUser: {user.lower()}")
 
         for host in sudo_hosts:
             lines.append(f"sudoHost: {host}")
@@ -488,12 +557,11 @@ def main() -> None:
             sys.exit(2)
 
     try:
-        policy_map = build_policy_map(source_csv)
+        policy_map = build_policy_map(source_csv, resolver)
         entries = build_ldif_entries(
             policy_map,
             base_dn=args.base_dn,
             host_all_threshold=args.host_all_threshold,
-            resolver=resolver,
         )
 
         output_ldif.write_text("\n\n".join(entries) + "\n", encoding="utf-8")
