@@ -238,14 +238,19 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
     if not cleaned:
         return ParsedRule("ALL", tuple(), tuple(["ALL"]), tuple())
 
-    # Expected format (typical): "<who> <hostspec>=(<runas>) <cmdspec>"
-    match = re.match(r"^(?P<who>\S+)\s+(?P<host>\S+)\s*=\s*\((?P<runas>[^)]*)\)\s*(?P<cmd>.+)$", cleaned)
+    # Support both forms:
+    # 1) <who> <hostspec>=(<runas>) <cmdspec>
+    # 2) <who> <hostspec>=<cmdspec> (no explicit runas)
+    match = re.match(
+        r"^(?P<who>\S+)\s+(?P<host>\S+)\s*=\s*(?:\((?P<runas>[^)]*)\)\s*)?(?P<cmd>.+)$",
+        cleaned,
+    )
     if not match:
         # Fall back to preserving entire token stream as a single command.
         return ParsedRule("ALL", tuple(), tuple([cleaned]), tuple())
 
     host_spec = match.group("host").strip()
-    runas_raw = match.group("runas").strip()
+    runas_raw = (match.group("runas") or "").strip()
     cmdspec = match.group("cmd").strip()
 
     runas_users = tuple(sorted(_split_csvish_values(runas_raw))) if runas_raw else tuple()
@@ -259,11 +264,18 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
         if not p:
             continue
 
-        # Tokens like NOPASSWD:, PASSWD:, SETENV: are exported as sudoOption.
-        opt_match = re.match(r"^((?:[A-Z_]+:)\s+)(.+)$", p)
-        if opt_match:
-            option_tokens.append(opt_match.group(1).strip())
-            p = opt_match.group(2).strip()
+        # Extract one or more leading option tokens:
+        # NOPASSWD: /bin/cmd
+        # NOPASSWD:/bin/cmd
+        # NOPASSWD : /bin/cmd
+        while True:
+            opt_match = re.match(r"^(?P<opt>[A-Z_]+)\s*:\s*(?P<rest>.*)$", p)
+            if not opt_match:
+                break
+            option_tokens.append(f"{opt_match.group('opt').upper()}:")
+            p = opt_match.group("rest").strip()
+            if not p:
+                break
 
         if p:
             commands.append(p)
