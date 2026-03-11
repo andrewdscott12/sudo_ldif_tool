@@ -258,9 +258,27 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
 
     option_tokens: List[str] = []
     commands: List[str] = []
+    known_option_words = ("NOPASSWD", "PASSWD", "NOEXEC", "EXEC", "SETENV", "NOSETENV")
 
     for part in command_parts:
         p = part.strip()
+        if not p:
+            continue
+
+        # If known option tags appear anywhere in the segment, capture them.
+        for opt_word in known_option_words:
+            if re.search(rf"\b{opt_word}\b", p, flags=re.IGNORECASE):
+                option_tokens.append(f"{opt_word}:")
+
+        # Remove inline option tags so they don't leak into sudoCommand values.
+        p = re.sub(
+            r"\b(?:NOPASSWD|PASSWD|NOEXEC|EXEC|SETENV|NOSETENV)\b\s*:?,?\s*",
+            " ",
+            p,
+            flags=re.IGNORECASE,
+        )
+        
+        p = re.sub(r"\s+", " ", p).strip()
         if not p:
             continue
 
