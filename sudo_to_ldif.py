@@ -262,8 +262,7 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
 
     for part in command_parts:
         p = part.strip()
-        if not p:
-            continue
+        if not Ok       continue
 
         # If known option tags appear anywhere in the segment, capture them.
         for opt_word in known_option_words:
@@ -332,14 +331,102 @@ class PolicyRecord:
     parsed: ParsedRule
 
 
+@dataclass
+class CsvParseDiagnostics:
+    total_rows: int = 0
+    skipped_rows: int = 0
+    invalid_rows: int = 0
+    invalid_samples: List[str] = None
+
+    def __post_init__(self) -> None:
+        if self.invalid_samples is None:
+            self.invalid_samples = []
+
+
+def _format_row_sample(raw_row: List[str], max_cell_length: int = 80) -> str:
+    if not raw_row:
+        return "<empty row>"
+
+    rendered_cells: List[str] = []
+    for cell in raw_row:
+        snippet = cell.strip().replace("\n", " ")
+        if len(snippet) > max_cell_length:
+            snippet = snippet[: max_cell_length - 3] + "..."
+        rendered_cells.append(snippet)
+    return " | ".join(rendered_cells)
+
+
+def _classify_invalid_row(raw_row: List[str]) -> str:
+    if not raw_row:
+        return "empty row"
+
+    if len(raw_row) < 4:
+        if len(raw_row) == 1 and (";" in raw_row[0] or "\t" in raw_row[0]):
+            return "looks like non-comma delimiter (found ';' or tab)"
+        return f"too few columns ({len(raw_row)}); expected 4 or 5"
+
+    if len(raw_row) > 5:
+        return f"more than 5 columns ({len(raw_row)}); policy text may be misquoted"
+
+    subject_type = raw_row[1].strip().lower() if len(raw_row) > 1 else ""
+    if subject_type not in {"user", "group"}:
+        return "column 2 must be 'user' or 'group'"
+
+    return "missing required value(s)"
+
+
+def _build_csv_format_error_message(source_csv: Path, diagnostics: CsvParseDiagnostics) -> str:
+    sample_lines: List[str] = []
+    for idx, sample in enumerate(diagnostics.invalid_samples, start=1):
+        sample_lines.append(f"  {idx}. {sample}")
+
+    expected = [
+        "Expected CSV format:",
+        "  5-column form:",
+        "    hostname,user|group,subject_name,policyfile,policy_line",
+        "  4-column form:",
+        "    hostname,user|group,subject_name,policyfile:policy_line",
+        "  Notes:",
+        "    - Delimiter must be a comma ','",
+        "    - Column 2 must be exactly 'user' or 'group'",
+        "    - Header rows and lines starting with '###' are ignored",
+    ]
+
+    details = [
+        f"CSV format check failed for {source_csv}.",
+        f"Read {diagnostics.total_rows} rows, skipped {diagnostics.skipped_rows}, and could not parse {diagnostics.invalid_rows} rows.",
+    ]
+
+    if sample_lines:
+        details.append("Sample problematic input rows:")
+        details.extend(sample_lines)
+
+    details.append("")
+    details.extend(expected)
+    return "\n".join(details)
+
+
 def build_policy_records(source_csv: Path) -> List[PolicyRecord]:
     records: List[PolicyRecord] = []
+    diagnostics = CsvParseDiagnostics()
 
     with source_csv.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.reader(handle)
         for raw_row in reader:
+            diagnostics.total_rows += 1
             normalized = normalize_csv_row(raw_row)
             if not normalized:
+                row_text = ",".join(raw_row).strip()
+                lower = row_text.lower()
+                if (not row_text) or row_text.startswith("###") or lower.startswith("hostname,user|group"):
+                    diagnostics.skipped_rows += 1
+                    continue
+
+                diagnostics.invalid_rows += 1
+                if len(diagnostics.invalid_samples) < 5:
+                    reason = _classify_invalid_row(raw_row)
+                    sample = _format_row_sample(raw_row)
+                    diagnostics.invalid_samples.append(f"{sample}  [{reason}]")
                 continue
 
             hostname, subject_type, subject_name, policyfile, policy_line = normalized
@@ -353,6 +440,9 @@ def build_policy_records(source_csv: Path) -> List[PolicyRecord]:
                     parsed=parsed,
                 )
             )
+
+    if not records and diagnostics.invalid_rows:
+        raise ValueError(_build_csv_format_error_message(source_csv, diagnostics))
 
     return records
 
@@ -604,7 +694,12 @@ def main() -> None:
             sys.exit(2)
 
     try:
-        policy_map = build_policy_map(source_csv, resolver)
+        try:
+            policy_map = build_policy_map(source_csv, resolver)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(3)
+
         entries = build_ldif_entries(
             policy_map,
             base_dn=args.base_dn,
