@@ -138,6 +138,9 @@ class LdapIdentityValidator:
         self._search_base = search_base
         self._user_attr = user_attr
         self._cache: Dict[str, Tuple[bool, Optional[str], str]] = {}
+        self._user_exists_cache: Dict[str, bool] = {}
+        self._group_exists_cache: Dict[str, bool] = {}
+        self._search_cache: Dict[str, bool] = {}
 
         server = Server(server_uri, get_info=ALL)
         self._conn = Connection(
@@ -156,8 +159,9 @@ class LdapIdentityValidator:
 
     def validate_sudo_user(self, raw_value: str) -> Tuple[bool, Optional[str], str]:
         value = raw_value.strip()
-        if value in self._cache:
-            return self._cache[value]
+        cache_key = value.casefold()
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
         original = value
         negated = value.startswith("!")
@@ -166,12 +170,12 @@ class LdapIdentityValidator:
 
         if not value or value.upper() == "ALL":
             result = (True, "special", "special token")
-            self._cache[original] = result
+            self._cache[cache_key] = result
             return result
 
         if value.startswith("+"):
             result = (True, "netgroup", "netgroup reference not validated via LDAP user/group lookup")
-            self._cache[original] = result
+            self._cache[cache_key] = result
             return result
 
         if value.startswith("%"):
@@ -179,7 +183,7 @@ class LdapIdentityValidator:
             group_exists = self._group_exists(group_name)
             if group_exists:
                 result = (True, "group", "LDAP group found")
-                self._cache[original] = result
+                self._cache[cache_key] = result
                 return result
 
             # If %name does not resolve as group, check if it is actually a user.
@@ -194,23 +198,23 @@ class LdapIdentityValidator:
                         f"Suggested fix: sudoUser '{suggested}'"
                     ),
                 )
-                self._cache[original] = result
+                self._cache[cache_key] = result
                 return result
 
             result = (False, None, "LDAP group not found")
-            self._cache[original] = result
+            self._cache[cache_key] = result
             return result
 
         # Numeric IDs can appear as #uid / #gid references.
         if value.startswith("#") and value[1:].isdigit():
             result = (True, "numeric", "numeric user/group ID reference")
-            self._cache[original] = result
+            self._cache[cache_key] = result
             return result
 
         user_exists = self._user_exists(value)
         if user_exists:
             result = (True, "user", "LDAP user found")
-            self._cache[original] = result
+            self._cache[cache_key] = result
             return result
 
         group_exists = self._group_exists(value)
@@ -224,11 +228,11 @@ class LdapIdentityValidator:
                     f"Suggested fix: sudoUser '{suggested}'"
                 ),
             )
-            self._cache[original] = result
+            self._cache[cache_key] = result
             return result
 
         result = (False, None, "LDAP user/group not found")
-        self._cache[original] = result
+        self._cache[cache_key] = result
         return result
 
     @staticmethod
@@ -236,6 +240,10 @@ class LdapIdentityValidator:
         return f"!{value}" if negated else value
 
     def _user_exists(self, user_name: str) -> bool:
+        key = user_name.strip().casefold()
+        if key in self._user_exists_cache:
+            return self._user_exists_cache[key]
+
         escaped = ldap_filter_escape(user_name)
         filter_expr = (
             "(&(objectClass=person)(|"
@@ -245,9 +253,15 @@ class LdapIdentityValidator:
             f"(cn={escaped})"
             "))"
         )
-        return self._search_one(filter_expr)
+        exists = self._search_one(filter_expr)
+        self._user_exists_cache[key] = exists
+        return exists
 
     def _group_exists(self, group_name: str) -> bool:
+        key = group_name.strip().casefold()
+        if key in self._group_exists_cache:
+            return self._group_exists_cache[key]
+
         escaped = ldap_filter_escape(group_name)
         name_matchers = [
             f"(cn={escaped})",
@@ -271,14 +285,20 @@ class LdapIdentityValidator:
             ")"
         )
         if self._search_one(strict_filter):
+            self._group_exists_cache[key] = True
             return True
 
         # Fallback: some directories don't use canonical group classes.
         # Look up by name and infer group-likeness from objectClass/member attributes.
         fallback_filter = name_filter
-        return self._search_group_like(fallback_filter)
+        exists = self._search_group_like(fallback_filter)
+        self._group_exists_cache[key] = exists
+        return exists
 
     def _search_one(self, filter_expr: str) -> bool:
+        if filter_expr in self._search_cache:
+            return self._search_cache[filter_expr]
+
         assert self._conn is not None
         # Use no-attribute retrieval for existence checks. Requesting "dn" as an
         # attribute can fail on some LDAP servers (including AD) because DN is not
@@ -298,7 +318,9 @@ class LdapIdentityValidator:
                 attributes=[],
                 size_limit=1,
             )
-        return bool(self._conn.entries)
+        exists = bool(self._conn.entries)
+        self._search_cache[filter_expr] = exists
+        return exists
 
     def _search_group_like(self, filter_expr: str) -> bool:
         assert self._conn is not None
