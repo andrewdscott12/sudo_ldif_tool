@@ -181,6 +181,11 @@ python3 sudo_ldif_validator.py INPUT_LDIF [options]
 - `--ldap-search-base <search_base>`
 - `--ldap-user-attr <attr>`
 - `--strict-options` (treat unknown option names as errors)
+- `--output-patch [patch_file]` (generate LDIF remediation patch)
+- `--command-whitelist <sudo_command_value>` (repeatable)
+- `--command-whitelist-file <path>`
+- `--verbose`
+- `--verbose-ldap-only`
 
 ### Validator example
 
@@ -195,3 +200,47 @@ python3 sudo_ldif_validator.py output.ldif \
 ```
 
 The validator prints PASS/FAIL per `sudoRole` and exits non-zero if any errors are found.
+
+### Command whitelist behavior
+
+By default, the validator checks each `sudoCommand` against commands available on the local system.
+If you validate from a system that does not have every target binary installed, you can whitelist
+specific `sudoCommand` values so they are treated as valid and are not removed by `--output-patch`.
+
+#### Inline whitelist entries (repeatable switch)
+
+Use one `--command-whitelist` flag per command value:
+
+```bash
+python3 sudo_ldif_validator.py output.ldif \
+  --ldap-uri "ldaps://dc01.corp.local" \
+  --ldap-search-base "dc=corp,dc=local" \
+  --command-whitelist "/usr/sbin/dmidecode" \
+  --command-whitelist "/opt/vendor/bin/custom-tool --check" \
+  --output-patch
+```
+
+#### Whitelist file input
+
+Use a newline-delimited file with one `sudoCommand` value per line.
+Blank lines and lines beginning with `#` are ignored.
+
+Example `command_whitelist.txt`:
+
+```text
+# keep vendor-managed tools even if not installed here
+/usr/sbin/dmidecode
+/opt/vendor/bin/custom-tool --check
+```
+
+Run validator with file-based whitelist:
+
+```bash
+python3 sudo_ldif_validator.py output.ldif \
+  --ldap-uri "ldaps://dc01.corp.local" \
+  --ldap-search-base "dc=corp,dc=local" \
+  --command-whitelist-file command_whitelist.txt \
+  --output-patch
+```
+
+You can combine both methods; entries from CLI and file are merged.

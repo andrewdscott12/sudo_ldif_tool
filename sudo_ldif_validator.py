@@ -494,6 +494,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--command-whitelist",
+        action="append",
+        default=[],
+        help=(
+            "Whitelist a sudoCommand value to keep even if not present on the local system. "
+            "Can be specified multiple times."
+        ),
+    )
+    parser.add_argument(
+        "--command-whitelist-file",
+        help=(
+            "Path to a newline-delimited whitelist file of sudoCommand values to keep "
+            "even when local command checks fail. Blank lines and lines starting with # are ignored."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print detailed progress to stderr for each value examined and LDAP lookup activity.",
@@ -645,6 +661,36 @@ def command_exists_on_system(command: str) -> Tuple[bool, str]:
     return False, f"command not found on PATH: {exe}"
 
 
+def normalize_whitelist_command(value: str) -> str:
+    return " ".join(value.strip().split())
+
+
+def load_command_whitelist(inline_values: List[str], whitelist_file: Optional[str]) -> set[str]:
+    whitelist: set[str] = set()
+    for value in inline_values:
+        normalized = normalize_whitelist_command(value)
+        if normalized:
+            whitelist.add(normalized)
+
+    if whitelist_file:
+        path = Path(whitelist_file)
+        if not path.exists():
+            raise ValueError(f"command whitelist file not found: {path}")
+        for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if (not line) or line.startswith("#"):
+                continue
+            normalized = normalize_whitelist_command(line)
+            if normalized:
+                whitelist.add(normalized)
+
+    return whitelist
+
+
+def is_command_whitelisted(command: str, whitelist: set[str]) -> bool:
+    return normalize_whitelist_command(command) in whitelist
+
+
 def canonicalize_sudo_option_for_patch(option: str) -> Optional[str]:
     token = option.strip()
     if not token:
@@ -696,6 +742,7 @@ def canonicalize_sudo_option_for_patch(option: str) -> Optional[str]:
 def build_patch_fixed_entries(
     entries: List[LdifEntry],
     ldap_validator: LdapIdentityValidator,
+    command_whitelist: set[str],
 ) -> Tuple[List[LdifEntry], int, int, int]:
     fixed_entries: List[LdifEntry] = []
     user_fixes = 0
@@ -735,6 +782,9 @@ def build_patch_fixed_entries(
         if "sudoCommand" in attrs:
             new_cmds: List[str] = []
             for cmd in attrs["sudoCommand"]:
+                if is_command_whitelisted(cmd, command_whitelist):
+                    new_cmds.append(cmd)
+                    continue
                 ok, _detail = command_exists_on_system(cmd)
                 if ok:
                     new_cmds.append(cmd)
@@ -814,6 +864,7 @@ def validate_entry(
     entry: LdifEntry,
     ldap_validator: LdapIdentityValidator,
     strict_options: bool,
+    command_whitelist: set[str],
     verbose: bool = False,
 ) -> EntryValidationResult:
     cn = first_attr(entry, "cn", default="<missing-cn>")
@@ -843,6 +894,16 @@ def validate_entry(
     for command in sudo_commands:
         if verbose:
             print(f"[verbose]   sudoCommand check: {command}", file=sys.stderr, flush=True)
+
+        if is_command_whitelisted(command, command_whitelist):
+            if verbose:
+                print(
+                    f"[verbose]   sudoCommand result: command={command} valid=True detail=whitelisted",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            continue
+
         ok, detail = command_exists_on_system(command)
         if verbose:
             print(
@@ -895,6 +956,12 @@ def main() -> None:
     ldap_verbose = args.verbose or args.verbose_ldap_only
     item_verbose = args.verbose and (not args.verbose_ldap_only)
 
+    try:
+        command_whitelist = load_command_whitelist(args.command_whitelist, args.command_whitelist_file)
+    except Exception as exc:
+        print(f"ERROR: Failed to load command whitelist: {exc}", file=sys.stderr)
+        sys.exit(5)
+
     input_ldif = Path(args.input_ldif)
     if not input_ldif.exists():
         print(f"ERROR: Input LDIF not found: {input_ldif}", file=sys.stderr)
@@ -929,12 +996,24 @@ def main() -> None:
             cn = first_attr(entry, "cn", default="<missing-cn>")
             dn = entry.dn or "<missing-dn>"
             print(f"[progress {idx}/{total}] validating cn={cn} dn={dn}", file=sys.stderr, flush=True)
-            results.append(validate_entry(entry, ldap_validator, args.strict_options, verbose=item_verbose))
+            results.append(
+                validate_entry(
+                    entry,
+                    ldap_validator,
+                    args.strict_options,
+                    command_whitelist,
+                    verbose=item_verbose,
+                )
+            )
 
         patch_generated = False
         if args.output_patch is not None:
             patch_path = resolve_patch_path(input_ldif, args.output_patch)
-            fixed_entries, user_fixes, option_fixes, command_fixes = build_patch_fixed_entries(sudo_entries, ldap_validator)
+            fixed_entries, user_fixes, option_fixes, command_fixes = build_patch_fixed_entries(
+                sudo_entries,
+                ldap_validator,
+                command_whitelist,
+            )
             merged_entries = merge_fixed_sudo_entries(entries, fixed_entries)
             fixed_ldif_text = render_ldif(merged_entries)
             patch_generated = write_ldif_patch(input_ldif, original_ldif_text, fixed_ldif_text, patch_path)
