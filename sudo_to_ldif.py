@@ -262,7 +262,8 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
 
     for part in command_parts:
         p = part.strip()
-        if not Ok       continue
+        if not p:
+            continue
 
         # If known option tags appear anywhere in the segment, capture them.
         for opt_word in known_option_words:
