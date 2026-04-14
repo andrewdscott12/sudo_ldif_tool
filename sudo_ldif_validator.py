@@ -175,6 +175,17 @@ class LdapIdentityValidator:
         if not self._conn.bound:
             raise RuntimeError("LDAP bind failed. Verify LDAP credentials and URL.")
 
+    def _candidate_user_attrs(self) -> List[str]:
+        # Keep this list short and index-friendly for large directories.
+        # We intentionally avoid broad CN lookups unless needed because they tend
+        # to be slower and can match many non-login objects.
+        attrs = [self._user_attr, "sAMAccountName", "uid", "userPrincipalName"]
+        unique: List[str] = []
+        for attr in attrs:
+            if attr and attr not in unique:
+                unique.append(attr)
+        return unique
+
     def close(self) -> None:
         if self._conn is not None and self._conn.bound:
             self._conn.unbind()
@@ -301,16 +312,25 @@ class LdapIdentityValidator:
             return self._user_exists_cache[key]
 
         escaped = ldap_filter_escape(user_name)
-        filter_expr = (
-            "(&(objectClass=person)(|"
-            f"({self._user_attr}={escaped})"
-            f"(uid={escaped})"
-            f"(sAMAccountName={escaped})"
-            f"(cn={escaped})"
-            "))"
-        )
-        exists = self._search_one(filter_expr)
-        self._vlog(f"user-exists ldap search for '{user_name}' -> {exists}")
+        exists = False
+        for attr in self._candidate_user_attrs():
+            # Use one exact attribute at a time to improve index usage on LDAP servers.
+            filter_expr = (
+                "(&(|"
+                "(objectClass=user)"
+                "(objectClass=person)"
+                "(objectClass=inetOrgPerson)"
+                "(objectClass=posixAccount)"
+                f")({attr}={escaped}))"
+            )
+            if self._search_one(filter_expr):
+                exists = True
+                self._vlog(f"user-exists ldap search for '{user_name}' matched on {attr}")
+                break
+
+        if not exists:
+            self._vlog(f"user-exists ldap search for '{user_name}' -> False")
+
         self._user_exists_cache[key] = exists
         return exists
 
