@@ -366,6 +366,16 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
             runas_raw = (host_eq.group("runas") or "").strip()
             cmdspec = host_eq.group("cmd").strip()
         else:
+            # Before treating the whole string as a bare command, check whether it
+            # is really a standalone option token (e.g. "!requiretty", "NOPASSWD:").
+            # This happens when a CSV row contains only an option spec with no
+            # host/runas structure – the token should become a sudoOption, not a
+            # sudoCommand.
+            parts = _split_csvish_values(cleaned)
+            opt_parts = [t.rstrip(":") for t in parts if t]
+            if opt_parts and all(_looks_like_option_token(t) for t in opt_parts):
+                translated = {translate_sudo_option(t) for t in opt_parts if t}
+                return ParsedRule("ALL", tuple(), tuple(), tuple(sorted(translated)))
             # Fall back to preserving entire token stream as a single command.
             return ParsedRule("ALL", tuple(), tuple([cleaned]), tuple())
 
