@@ -280,22 +280,53 @@ class LdapIdentityValidator:
 
     def _search_one(self, filter_expr: str) -> bool:
         assert self._conn is not None
-        self._conn.search(
-            search_base=self._search_base,
-            search_filter=filter_expr,
-            attributes=["dn"],
-            size_limit=1,
-        )
+        # Use no-attribute retrieval for existence checks. Requesting "dn" as an
+        # attribute can fail on some LDAP servers (including AD) because DN is not
+        # a regular attribute type.
+        try:
+            self._conn.search(
+                search_base=self._search_base,
+                search_filter=filter_expr,
+                attributes=["1.1"],
+                size_limit=1,
+            )
+        except Exception:
+            # Fallback for servers that don't like 1.1 in this context.
+            self._conn.search(
+                search_base=self._search_base,
+                search_filter=filter_expr,
+                attributes=[],
+                size_limit=1,
+            )
         return bool(self._conn.entries)
 
     def _search_group_like(self, filter_expr: str) -> bool:
         assert self._conn is not None
-        self._conn.search(
-            search_base=self._search_base,
-            search_filter=filter_expr,
-            attributes=["objectClass", "member", "memberUid", "uniqueMember", "gidNumber"],
-            size_limit=5,
-        )
+        # Different LDAP schemas expose different group attributes. Try richer
+        # attribute sets first, then degrade to broadly supported AD/OpenLDAP sets.
+        attribute_sets = [
+            ["objectClass", "member", "memberUid", "uniqueMember", "gidNumber", "distinguishedName"],
+            ["objectClass", "member", "uniqueMember", "distinguishedName"],
+            ["objectClass", "member", "distinguishedName"],
+            ["objectClass"],
+        ]
+
+        searched = False
+        for attrs in attribute_sets:
+            try:
+                self._conn.search(
+                    search_base=self._search_base,
+                    search_filter=filter_expr,
+                    attributes=attrs,
+                    size_limit=5,
+                )
+                searched = True
+                break
+            except Exception:
+                continue
+
+        if not searched:
+            return False
 
         for entry in self._conn.entries:
             object_classes = [str(v).lower() for v in getattr(entry, "objectClass").values] if hasattr(entry, "objectClass") else []
