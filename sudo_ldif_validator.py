@@ -11,6 +11,7 @@ Validation checks:
 from __future__ import annotations
 
 import argparse
+import difflib
 import glob
 import os
 import re
@@ -99,6 +100,25 @@ KNOWN_LDAP_OPTION_NAMES = {
     "insults",
     "requiretty",
     "shell_noargs",
+}
+
+TAG_TO_LDAP_OPTION = {
+    "NOPASSWD": "!authenticate",
+    "PASSWD": "authenticate",
+    "NOEXEC": "noexec",
+    "EXEC": "!noexec",
+    "SETENV": "setenv",
+    "NOSETENV": "!setenv",
+    "LOG_INPUT": "log_input",
+    "NOLOG_INPUT": "!log_input",
+    "LOG_OUTPUT": "log_output",
+    "NOLOG_OUTPUT": "!log_output",
+    "FOLLOW": "follow",
+    "NOFOLLOW": "!follow",
+    "INTERCEPT": "intercept",
+    "NOINTERCEPT": "!intercept",
+    "MAIL": "mail_all_cmnds",
+    "NOMAIL": "!mail_all_cmnds",
 }
 
 
@@ -238,6 +258,32 @@ class LdapIdentityValidator:
     @staticmethod
     def _with_negation(value: str, negated: bool) -> str:
         return f"!{value}" if negated else value
+
+    def suggest_sudo_user_fix(self, raw_value: str) -> Optional[str]:
+        value = raw_value.strip()
+        if not value:
+            return None
+
+        negated = value.startswith("!")
+        core = value[1:].strip() if negated else value
+
+        if not core or core.upper() == "ALL" or core.startswith("+"):
+            return None
+        if core.startswith("#") and core[1:].isdigit():
+            return None
+
+        if core.startswith("%"):
+            group_name = core[1:].strip()
+            if not group_name:
+                return None
+            if not self._group_exists(group_name) and self._user_exists(group_name):
+                return self._with_negation(group_name, negated)
+            return None
+
+        if not self._user_exists(core) and self._group_exists(core):
+            return self._with_negation(f"%{core}", negated)
+
+        return None
 
     def _user_exists(self, user_name: str) -> bool:
         key = user_name.strip().casefold()
@@ -400,6 +446,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Treat unknown sudoOption names as errors instead of warnings",
     )
+    parser.add_argument(
+        "--output-patch",
+        nargs="?",
+        const="",
+        metavar="PATCH_FILE",
+        help=(
+            "Generate a unified diff patch that fixes sudoUser marker confusion, "
+            "corrects/removes invalid sudoOption values, and removes invalid sudoCommand values. "
+            "If PATCH_FILE is omitted, defaults to <input_ldif>.patch."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -542,6 +599,171 @@ def command_exists_on_system(command: str) -> Tuple[bool, str]:
     return False, f"command not found on PATH: {exe}"
 
 
+def canonicalize_sudo_option_for_patch(option: str) -> Optional[str]:
+    token = option.strip()
+    if not token:
+        return None
+
+    raw = token.rstrip(":")
+    core = raw.lstrip("!")
+
+    # Convert legacy tag syntax (e.g. NOPASSWD:) when possible.
+    mapped = TAG_TO_LDAP_OPTION.get(core.upper())
+    if mapped:
+        if raw.startswith("!") and not mapped.startswith("!"):
+            return f"!{mapped}"
+        return mapped
+
+    # Convert NO<option> forms into !option if recognized.
+    upper = core.upper()
+    if upper.startswith("NO"):
+        candidate = upper[2:].lower()
+        if candidate in KNOWN_LDAP_OPTION_NAMES:
+            return f"!{candidate}"
+
+    # Normalize plain forms.
+    if raw.startswith("!"):
+        candidate = raw[1:]
+        if "=" in candidate:
+            key, value = candidate.split("=", 1)
+            if key.lower() in KNOWN_LDAP_OPTION_NAMES:
+                return f"!{key.lower()}={value}"
+            return None
+        if candidate.lower() in KNOWN_LDAP_OPTION_NAMES:
+            return f"!{candidate.lower()}"
+        return None
+
+    if "=" in raw:
+        key, value = raw.split("=", 1)
+        if key.lower() in KNOWN_LDAP_OPTION_NAMES:
+            return f"{key.lower()}={value}"
+        return None
+
+    lowered = raw.lower()
+    if lowered in KNOWN_LDAP_OPTION_NAMES:
+        return lowered
+
+    # Syntax or schema unknown: remove from patch output.
+    return None
+
+
+def build_patch_fixed_entries(
+    entries: List[LdifEntry],
+    ldap_validator: LdapIdentityValidator,
+) -> Tuple[List[LdifEntry], int, int, int]:
+    fixed_entries: List[LdifEntry] = []
+    user_fixes = 0
+    option_fixes = 0
+    command_fixes = 0
+
+    for entry in entries:
+        # Copy attribute lists so we can mutate without touching parsed originals.
+        attrs = {k: list(v) for k, v in entry.attributes.items()}
+
+        # Fix sudoUser marker confusion.
+        if "sudoUser" in attrs:
+            new_users: List[str] = []
+            for sudo_user in attrs["sudoUser"]:
+                suggestion = ldap_validator.suggest_sudo_user_fix(sudo_user)
+                if suggestion and suggestion != sudo_user:
+                    new_users.append(suggestion)
+                    user_fixes += 1
+                else:
+                    new_users.append(sudo_user)
+            attrs["sudoUser"] = _dedupe_preserve_order(new_users)
+
+        # Correct or remove invalid sudoOption values.
+        if "sudoOption" in attrs:
+            new_opts: List[str] = []
+            for opt in attrs["sudoOption"]:
+                fixed_opt = canonicalize_sudo_option_for_patch(opt)
+                if fixed_opt is None:
+                    option_fixes += 1
+                    continue
+                if fixed_opt != opt:
+                    option_fixes += 1
+                new_opts.append(fixed_opt)
+            attrs["sudoOption"] = _dedupe_preserve_order(new_opts)
+
+        # Remove invalid sudoCommand values.
+        if "sudoCommand" in attrs:
+            new_cmds: List[str] = []
+            for cmd in attrs["sudoCommand"]:
+                ok, _detail = command_exists_on_system(cmd)
+                if ok:
+                    new_cmds.append(cmd)
+                else:
+                    command_fixes += 1
+            attrs["sudoCommand"] = _dedupe_preserve_order(new_cmds)
+
+        fixed_entries.append(LdifEntry(dn=entry.dn, attributes=attrs))
+
+    return fixed_entries, user_fixes, option_fixes, command_fixes
+
+
+def merge_fixed_sudo_entries(
+    all_entries: List[LdifEntry],
+    fixed_sudo_entries: List[LdifEntry],
+) -> List[LdifEntry]:
+    merged: List[LdifEntry] = []
+    fixed_idx = 0
+    for entry in all_entries:
+        if is_sudo_role_entry(entry):
+            merged.append(fixed_sudo_entries[fixed_idx])
+            fixed_idx += 1
+        else:
+            merged.append(entry)
+    return merged
+
+
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def render_ldif(entries: List[LdifEntry]) -> str:
+    lines: List[str] = []
+    for entry in entries:
+        lines.append(f"dn: {entry.dn}")
+        for key, values in entry.attributes.items():
+            if key.lower() == "dn":
+                continue
+            for value in values:
+                lines.append(f"{key}: {value}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def resolve_patch_path(input_ldif: Path, patch_arg: Optional[str]) -> Path:
+    if patch_arg is None:
+        raise ValueError("patch_arg must not be None")
+    if patch_arg.strip():
+        return Path(patch_arg).expanduser().resolve()
+    return input_ldif.with_suffix(input_ldif.suffix + ".patch")
+
+
+def write_ldif_patch(input_ldif: Path, original_text: str, fixed_text: str, patch_path: Path) -> bool:
+    diff_lines = list(
+        difflib.unified_diff(
+            original_text.splitlines(keepends=True),
+            fixed_text.splitlines(keepends=True),
+            fromfile=str(input_ldif),
+            tofile=str(input_ldif),
+        )
+    )
+    if not diff_lines:
+        return False
+
+    patch_path.write_text("".join(diff_lines), encoding="utf-8")
+    return True
+
+
 def validate_entry(
     entry: LdifEntry,
     ldap_validator: LdapIdentityValidator,
@@ -604,6 +826,8 @@ def main() -> None:
         print(f"ERROR: Input LDIF not found: {input_ldif}", file=sys.stderr)
         sys.exit(1)
 
+    original_ldif_text = input_ldif.read_text(encoding="utf-8", errors="replace")
+
     try:
         ldap_validator = LdapIdentityValidator(
             server_uri=args.ldap_uri or "",
@@ -624,7 +848,32 @@ def main() -> None:
             print(f"ERROR: No sudoRole entries found in {input_ldif}", file=sys.stderr)
             sys.exit(3)
 
-        results = [validate_entry(entry, ldap_validator, args.strict_options) for entry in sudo_entries]
+        results: List[EntryValidationResult] = []
+        total = len(sudo_entries)
+        for idx, entry in enumerate(sudo_entries, start=1):
+            cn = first_attr(entry, "cn", default="<missing-cn>")
+            dn = entry.dn or "<missing-dn>"
+            print(f"[progress {idx}/{total}] validating cn={cn} dn={dn}", file=sys.stderr, flush=True)
+            results.append(validate_entry(entry, ldap_validator, args.strict_options))
+
+        patch_generated = False
+        if args.output_patch is not None:
+            patch_path = resolve_patch_path(input_ldif, args.output_patch)
+            fixed_entries, user_fixes, option_fixes, command_fixes = build_patch_fixed_entries(sudo_entries, ldap_validator)
+            merged_entries = merge_fixed_sudo_entries(entries, fixed_entries)
+            fixed_ldif_text = render_ldif(merged_entries)
+            patch_generated = write_ldif_patch(input_ldif, original_ldif_text, fixed_ldif_text, patch_path)
+
+            if patch_generated:
+                print(
+                    "\nPatch file created: "
+                    f"{patch_path} "
+                    f"(sudoUser fixes: {user_fixes}, sudoOption fixes/removals: {option_fixes}, "
+                    f"sudoCommand removals: {command_fixes})"
+                )
+                print("Apply with: patch < " + str(patch_path))
+            else:
+                print("\nNo patch changes were needed; no patch file written.")
     finally:
         ldap_validator.close()
 
