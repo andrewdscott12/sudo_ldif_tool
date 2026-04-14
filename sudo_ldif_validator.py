@@ -148,6 +148,7 @@ class LdapIdentityValidator:
         bind_password: Optional[str],
         search_base: str,
         user_attr: str = "uid",
+        verbose: bool = False,
     ) -> None:
         if not (server_uri and search_base):
             raise ValueError("--ldap-uri and --ldap-search-base are required for sudoUser validation")
@@ -157,6 +158,7 @@ class LdapIdentityValidator:
         self._conn: Optional[Any] = None
         self._search_base = search_base
         self._user_attr = user_attr
+        self._verbose = verbose
         self._cache: Dict[str, Tuple[bool, Optional[str], str]] = {}
         self._user_exists_cache: Dict[str, bool] = {}
         self._group_exists_cache: Dict[str, bool] = {}
@@ -177,11 +179,18 @@ class LdapIdentityValidator:
         if self._conn is not None and self._conn.bound:
             self._conn.unbind()
 
+    def _vlog(self, message: str) -> None:
+        if self._verbose:
+            print(f"[verbose] {message}", file=sys.stderr, flush=True)
+
     def validate_sudo_user(self, raw_value: str) -> Tuple[bool, Optional[str], str]:
         value = raw_value.strip()
         cache_key = value.casefold()
         if cache_key in self._cache:
+            self._vlog(f"sudoUser cache hit for '{raw_value}'")
             return self._cache[cache_key]
+
+        self._vlog(f"sudoUser evaluate '{raw_value}'")
 
         original = value
         negated = value.startswith("!")
@@ -288,6 +297,7 @@ class LdapIdentityValidator:
     def _user_exists(self, user_name: str) -> bool:
         key = user_name.strip().casefold()
         if key in self._user_exists_cache:
+            self._vlog(f"user-exists cache hit for '{user_name}' -> {self._user_exists_cache[key]}")
             return self._user_exists_cache[key]
 
         escaped = ldap_filter_escape(user_name)
@@ -300,12 +310,14 @@ class LdapIdentityValidator:
             "))"
         )
         exists = self._search_one(filter_expr)
+        self._vlog(f"user-exists ldap search for '{user_name}' -> {exists}")
         self._user_exists_cache[key] = exists
         return exists
 
     def _group_exists(self, group_name: str) -> bool:
         key = group_name.strip().casefold()
         if key in self._group_exists_cache:
+            self._vlog(f"group-exists cache hit for '{group_name}' -> {self._group_exists_cache[key]}")
             return self._group_exists_cache[key]
 
         escaped = ldap_filter_escape(group_name)
@@ -331,6 +343,7 @@ class LdapIdentityValidator:
             ")"
         )
         if self._search_one(strict_filter):
+            self._vlog(f"group-exists strict search for '{group_name}' -> True")
             self._group_exists_cache[key] = True
             return True
 
@@ -338,11 +351,13 @@ class LdapIdentityValidator:
         # Look up by name and infer group-likeness from objectClass/member attributes.
         fallback_filter = name_filter
         exists = self._search_group_like(fallback_filter)
+        self._vlog(f"group-exists fallback search for '{group_name}' -> {exists}")
         self._group_exists_cache[key] = exists
         return exists
 
     def _search_one(self, filter_expr: str) -> bool:
         if filter_expr in self._search_cache:
+            self._vlog("ldap search cache hit")
             return self._search_cache[filter_expr]
 
         assert self._conn is not None
@@ -350,6 +365,7 @@ class LdapIdentityValidator:
         # attribute can fail on some LDAP servers (including AD) because DN is not
         # a regular attribute type.
         try:
+            self._vlog("ldap search execute (attributes=1.1)")
             self._conn.search(
                 search_base=self._search_base,
                 search_filter=filter_expr,
@@ -358,6 +374,7 @@ class LdapIdentityValidator:
             )
         except Exception:
             # Fallback for servers that don't like 1.1 in this context.
+            self._vlog("ldap search retry (attributes=[]) after 1.1 failure")
             self._conn.search(
                 search_base=self._search_base,
                 search_filter=filter_expr,
@@ -382,6 +399,7 @@ class LdapIdentityValidator:
         searched = False
         for attrs in attribute_sets:
             try:
+                self._vlog(f"group-like search execute (attributes={attrs})")
                 self._conn.search(
                     search_base=self._search_base,
                     search_filter=filter_expr,
@@ -391,6 +409,7 @@ class LdapIdentityValidator:
                 searched = True
                 break
             except Exception:
+                self._vlog(f"group-like search attribute set failed: {attrs}")
                 continue
 
         if not searched:
@@ -456,6 +475,16 @@ def parse_args() -> argparse.Namespace:
             "corrects/removes invalid sudoOption values, and removes invalid sudoCommand values. "
             "If PATCH_FILE is omitted, defaults to <input_ldif>.patch."
         ),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed progress to stderr for each value examined and LDAP lookup activity.",
+    )
+    parser.add_argument(
+        "--verbose-ldap-only",
+        action="store_true",
+        help="Print only LDAP/cache lookup diagnostics to stderr (less noisy than --verbose).",
     )
     return parser.parse_args()
 
@@ -768,6 +797,7 @@ def validate_entry(
     entry: LdifEntry,
     ldap_validator: LdapIdentityValidator,
     strict_options: bool,
+    verbose: bool = False,
 ) -> EntryValidationResult:
     cn = first_attr(entry, "cn", default="<missing-cn>")
     result = EntryValidationResult(dn=entry.dn, cn=cn)
@@ -776,7 +806,15 @@ def validate_entry(
     if not sudo_users:
         result.errors.append("missing sudoUser")
     for value in sudo_users:
+        if verbose:
+            print(f"[verbose]   sudoUser check: {value}", file=sys.stderr, flush=True)
         valid, identity_type, detail = ldap_validator.validate_sudo_user(value)
+        if verbose:
+            print(
+                f"[verbose]   sudoUser result: value={value} valid={valid} type={identity_type} detail={detail}",
+                file=sys.stderr,
+                flush=True,
+            )
         if not valid:
             result.errors.append(f"sudoUser '{value}' invalid: {detail}")
         elif identity_type == "netgroup":
@@ -786,13 +824,29 @@ def validate_entry(
     if not sudo_commands:
         result.errors.append("missing sudoCommand")
     for command in sudo_commands:
+        if verbose:
+            print(f"[verbose]   sudoCommand check: {command}", file=sys.stderr, flush=True)
         ok, detail = command_exists_on_system(command)
+        if verbose:
+            print(
+                f"[verbose]   sudoCommand result: command={command} valid={ok} detail={detail}",
+                file=sys.stderr,
+                flush=True,
+            )
         if not ok:
             result.errors.append(f"sudoCommand '{command}' invalid: {detail}")
 
     sudo_options = entry.attributes.get("sudoOption", [])
     for option in sudo_options:
+        if verbose:
+            print(f"[verbose]   sudoOption check: {option}", file=sys.stderr, flush=True)
         valid, error_text, warning_text = validate_sudo_option(option)
+        if verbose:
+            print(
+                f"[verbose]   sudoOption result: option={option} valid={valid} error={error_text} warning={warning_text}",
+                file=sys.stderr,
+                flush=True,
+            )
         if not valid and error_text:
             result.errors.append(error_text)
         elif warning_text:
@@ -821,6 +875,9 @@ def ldap_filter_escape(value: str) -> str:
 def main() -> None:
     args = parse_args()
 
+    ldap_verbose = args.verbose or args.verbose_ldap_only
+    item_verbose = args.verbose and (not args.verbose_ldap_only)
+
     input_ldif = Path(args.input_ldif)
     if not input_ldif.exists():
         print(f"ERROR: Input LDIF not found: {input_ldif}", file=sys.stderr)
@@ -835,6 +892,7 @@ def main() -> None:
             bind_password=args.ldap_bind_password,
             search_base=args.ldap_search_base or "",
             user_attr=args.ldap_user_attr,
+            verbose=ldap_verbose,
         )
     except Exception as exc:
         print(f"ERROR: Failed to initialize LDAP validator: {exc}", file=sys.stderr)
@@ -854,7 +912,7 @@ def main() -> None:
             cn = first_attr(entry, "cn", default="<missing-cn>")
             dn = entry.dn or "<missing-dn>"
             print(f"[progress {idx}/{total}] validating cn={cn} dn={dn}", file=sys.stderr, flush=True)
-            results.append(validate_entry(entry, ldap_validator, args.strict_options))
+            results.append(validate_entry(entry, ldap_validator, args.strict_options, verbose=item_verbose))
 
         patch_generated = False
         if args.output_patch is not None:
