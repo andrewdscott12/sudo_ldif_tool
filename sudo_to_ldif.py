@@ -430,13 +430,19 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
             if not p:
                 break
 
+        # Handle bare LDAP-style option tokens that occupy the entire segment,
+        # e.g. !requiretty or secure_path=/usr/sbin:/usr/bin.
+        if p and _looks_like_option_token(p):
+            option_tokens.append(p)
+            continue
+
         if p:
             commands.append(p)
 
-    if not commands:
-        commands = ["ALL"]
-
     translated_options = {translate_sudo_option(token) for token in option_tokens if token.strip()}
+
+    if not commands and not translated_options:
+        commands = ["ALL"]
 
     # Negated options should win if both forms are present.
     if "!authenticate" in translated_options:
