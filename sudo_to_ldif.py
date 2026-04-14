@@ -29,6 +29,54 @@ SUDO_BASE_DN = "ou=SUDOers,dc=example,dc=com"
 DEFAULT_HOST_ALL_THRESHOLD = 25
 USER_NAME_ATTRS = ("uid", "sAMAccountName", "cn")
 
+KNOWN_LDAP_OPTION_NAMES = {
+    "authenticate",
+    "requiretty",
+    "noexec",
+    "setenv",
+    "env_reset",
+    "always_set_home",
+    "stay_setuid",
+    "match_group_by_gid",
+    "visiblepw",
+    "env_editor",
+    "rootpw",
+    "runaspw",
+    "targetpw",
+    "log_input",
+    "log_output",
+    "use_pty",
+    "mail_always",
+    "mail_all_cmnds",
+    "mail_no_user",
+    "mail_no_host",
+    "ignore_local_sudoers",
+    "fqdn",
+    "intercept",
+    "follow",
+    "verifypw",
+    "listpw",
+}
+
+TAG_TO_LDAP_OPTION = {
+    "NOPASSWD": "!authenticate",
+    "PASSWD": "authenticate",
+    "NOEXEC": "noexec",
+    "EXEC": "!noexec",
+    "SETENV": "setenv",
+    "NOSETENV": "!setenv",
+    "LOG_INPUT": "log_input",
+    "NOLOG_INPUT": "!log_input",
+    "LOG_OUTPUT": "log_output",
+    "NOLOG_OUTPUT": "!log_output",
+    "FOLLOW": "follow",
+    "NOFOLLOW": "!follow",
+    "INTERCEPT": "intercept",
+    "NOINTERCEPT": "!intercept",
+    "MAIL": "mail_all_cmnds",
+    "NOMAIL": "!mail_all_cmnds",
+}
+
 
 @dataclass(frozen=True)
 class ParsedRule:
@@ -261,39 +309,78 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
         r"^(?P<who>\S+)\s+(?P<host>\S+)\s*=\s*(?:\((?P<runas>[^)]*)\)\s*)?(?P<cmd>.+)$",
         cleaned,
     )
-    if not match:
-        # Fall back to preserving entire token stream as a single command.
-        return ParsedRule("ALL", tuple(), tuple([cleaned]), tuple())
+    if match:
+        host_spec = match.group("host").strip()
+        runas_raw = (match.group("runas") or "").strip()
+        cmdspec = match.group("cmd").strip()
+    else:
+        # Also support compact forms seen in exports, e.g.:
+        # ALL(ALL) NOPASSWD: /bin/bash
+        # ALL(root) /bin/systemctl
+        compact = re.match(
+            r"^(?P<host>\S+)\s*\((?P<runas>[^)]*)\)\s*(?P<cmd>.+)$",
+            cleaned,
+        )
+        host_eq = re.match(
+            r"^(?P<host>\S+)\s*=\s*(?:\((?P<runas>[^)]*)\)\s*)?(?P<cmd>.+)$",
+            cleaned,
+        )
+        if compact:
+            host_spec = compact.group("host").strip()
+            runas_raw = (compact.group("runas") or "").strip()
+            cmdspec = compact.group("cmd").strip()
+        elif host_eq:
+            host_spec = host_eq.group("host").strip()
+            runas_raw = (host_eq.group("runas") or "").strip()
+            cmdspec = host_eq.group("cmd").strip()
+        else:
+            # Fall back to preserving entire token stream as a single command.
+            return ParsedRule("ALL", tuple(), tuple([cleaned]), tuple())
 
-    host_spec = match.group("host").strip()
-    runas_raw = (match.group("runas") or "").strip()
-    cmdspec = match.group("cmd").strip()
-
-    runas_users = tuple(sorted(_split_csvish_values(runas_raw))) if runas_raw else tuple()
+    runas_users = (
+        tuple(sorted({_normalize_runas_value(v) for v in _split_csvish_values(runas_raw)}))
+        if runas_raw
+        else tuple()
+    )
     command_parts = _split_csvish_values(cmdspec)
 
     option_tokens: List[str] = []
     commands: List[str] = []
-    known_option_words = ("NOPASSWD", "PASSWD", "NOEXEC", "EXEC", "SETENV", "NOSETENV")
 
     for part in command_parts:
         p = part.strip()
         if not p:
             continue
 
-        # If known option tags appear anywhere in the segment, capture them.
-        for opt_word in known_option_words:
-            if re.search(rf"\b{opt_word}\b", p, flags=re.IGNORECASE):
-                option_tokens.append(f"{opt_word}:")
-
-        # Remove inline option tags so they don't leak into sudoCommand values.
-        p = re.sub(
-            r"\b(?:NOPASSWD|PASSWD|NOEXEC|EXEC|SETENV|NOSETENV)\b\s*:?,?\s*",
-            " ",
+        # Some exports embed host/runas in the command segment itself.
+        embedded = re.match(
+            r"^(?P<host>\S+)\s*\((?P<runas>[^)]*)\)\s*(?P<rest>.+)$",
             p,
-            flags=re.IGNORECASE,
         )
-        
+        if embedded:
+            embedded_host = embedded.group("host").strip()
+            embedded_runas = (embedded.group("runas") or "").strip()
+            if embedded_host:
+                host_spec = embedded_host
+            if embedded_runas:
+                for value in _split_csvish_values(embedded_runas):
+                    runas_value = _normalize_runas_value(value)
+                    if runas_value:
+                        runas_users = tuple(sorted(set(runas_users) | {runas_value}))
+            p = embedded.group("rest").strip()
+            if not p:
+                continue
+
+        # Consume leading option fragments until a command token remains.
+        while True:
+            opt_token, rest = _extract_leading_option_token(p)
+            if not opt_token:
+                break
+            option_tokens.append(opt_token)
+            p = rest
+            if not p:
+                break
+
         p = re.sub(r"\s+", " ", p).strip()
         if not p:
             continue
@@ -303,10 +390,10 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
         # NOPASSWD:/bin/cmd
         # NOPASSWD : /bin/cmd
         while True:
-            opt_match = re.match(r"^(?P<opt>[A-Z_]+)\s*:\s*(?P<rest>.*)$", p)
+            opt_match = re.match(r"^(?P<opt>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<rest>.*)$", p)
             if not opt_match:
                 break
-            option_tokens.append(f"{opt_match.group('opt').upper()}:")
+            option_tokens.append(opt_match.group("opt"))
             p = opt_match.group("rest").strip()
             if not p:
                 break
@@ -317,21 +404,81 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
     if not commands:
         commands = ["ALL"]
 
-    normalized_options = set(option_tokens)
+    translated_options = {translate_sudo_option(token) for token in option_tokens if token.strip()}
+
     # Negated options should win if both forms are present.
-    if "NOPASSWD:" in normalized_options:
-        normalized_options.discard("PASSWD:")
-    if "NOEXEC:" in normalized_options:
-        normalized_options.discard("EXEC:")
-    if "NOSETENV:" in normalized_options:
-        normalized_options.discard("SETENV:")
+    if "!authenticate" in translated_options:
+        translated_options.discard("authenticate")
+    if "noexec" in translated_options:
+        translated_options.discard("!noexec")
+    if "!setenv" in translated_options:
+        translated_options.discard("setenv")
+    if "!log_input" in translated_options:
+        translated_options.discard("log_input")
+    if "!log_output" in translated_options:
+        translated_options.discard("log_output")
+    if "!follow" in translated_options:
+        translated_options.discard("follow")
+    if "!intercept" in translated_options:
+        translated_options.discard("intercept")
+    if "!requiretty" in translated_options:
+        translated_options.discard("requiretty")
 
     return ParsedRule(
         host_spec=host_spec or "ALL",
         runas_users=tuple(runas_users),
         commands=tuple(commands),
-        option_tokens=tuple(sorted(normalized_options)),
+        option_tokens=tuple(sorted(translated_options)),
     )
+
+
+def _extract_leading_option_token(text: str) -> Tuple[Optional[str], str]:
+    # Tag form: NOPASSWD: /bin/bash
+    colon_tag = re.match(r"^(?P<opt>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<rest>.+)$", text)
+    if colon_tag:
+        return colon_tag.group("opt"), colon_tag.group("rest").strip()
+
+    # LDAP option form: !requiretty /bin/bash or requiretty /bin/bash
+    bare = re.match(r"^(?P<opt>!?[A-Za-z_][A-Za-z0-9_]*(?:=[^\s,]+)?)\s+(?P<rest>.+)$", text)
+    if bare:
+        token = bare.group("opt")
+        if _looks_like_option_token(token):
+            return token, bare.group("rest").strip()
+
+    return None, text
+
+
+def _looks_like_option_token(token: str) -> bool:
+    cleaned = token.strip()
+    if not cleaned:
+        return False
+
+    negated = cleaned.startswith("!")
+    core = cleaned[1:] if negated else cleaned
+    core_upper = core.upper()
+    core_lower = core.lower()
+
+    if core_upper in TAG_TO_LDAP_OPTION:
+        return True
+    if core_lower in KNOWN_LDAP_OPTION_NAMES:
+        return True
+    if core_upper.startswith("NO") and core_upper[2:].lower() in KNOWN_LDAP_OPTION_NAMES:
+        return True
+    if "=" in core:
+        key = core.split("=", 1)[0].lower()
+        if key in KNOWN_LDAP_OPTION_NAMES:
+            return True
+    return False
+
+
+def _normalize_runas_value(value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        return ""
+    # LDAP sudoRunAsUser generally expects concrete names; map ALL to root.
+    if cleaned.upper() == "ALL":
+        return "root"
+    return cleaned
 
 
 def _split_csvish_values(raw: str) -> List[str]:
@@ -643,18 +790,32 @@ def translate_sudo_option(token: str) -> str:
     """
     Translate sudo option tokens (e.g., NOPASSWD:, SETENV:) to LDIF sudoOption format.
     """
-    token_upper = token.strip().upper().rstrip(":")
-    
-    option_map = {
-        "NOPASSWD": "!authenticate",
-        "PASSWD": "authenticate",
-        "NOEXEC": "noexec",
-        "EXEC": "!noexec",
-        "SETENV": "setenv",
-        "NOSETENV": "!setenv",
-    }
-    
-    return option_map.get(token_upper, token)
+    raw = token.strip().rstrip(":")
+    if not raw:
+        return raw
+
+    if raw.startswith("!"):
+        return raw.lower()
+
+    upper = raw.upper()
+    lower = raw.lower()
+
+    if upper in TAG_TO_LDAP_OPTION:
+        return TAG_TO_LDAP_OPTION[upper]
+
+    if upper.startswith("NO"):
+        candidate = upper[2:].lower()
+        if candidate in KNOWN_LDAP_OPTION_NAMES:
+            return f"!{candidate}"
+
+    if "=" in raw:
+        key, value = raw.split("=", 1)
+        return f"{key.lower()}={value}"
+
+    if lower in KNOWN_LDAP_OPTION_NAMES:
+        return lower
+
+    return lower
 
 
 def sanitize_cn_component(raw: str) -> str:
