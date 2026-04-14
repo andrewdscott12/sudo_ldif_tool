@@ -249,6 +249,16 @@ class LdapIdentityValidator:
 
     def _group_exists(self, group_name: str) -> bool:
         escaped = ldap_filter_escape(group_name)
+        name_matchers = [
+            f"(cn={escaped})",
+            f"(sAMAccountName={escaped})",
+            f"(name={escaped})",  # Active Directory display/name attribute
+        ]
+        if group_name.isdigit():
+            name_matchers.append(f"(gidNumber={escaped})")
+
+        name_filter = "(|" + "".join(name_matchers) + ")"
+
         strict_filter = (
             "(&(|"
             "(objectCategory=group)"  # Active Directory canonical group category
@@ -256,26 +266,16 @@ class LdapIdentityValidator:
             "(objectClass=posixGroup)"
             "(objectClass=groupOfNames)"
             "(objectClass=groupOfUniqueNames)"
-            ")(|"
-            f"(cn={escaped})"
-            f"(sAMAccountName={escaped})"
-            f"(name={escaped})"  # Active Directory display/name attribute
-            f"(gidNumber={escaped})"
-            "))"
+            ")"
+            f"{name_filter}"
+            ")"
         )
         if self._search_one(strict_filter):
             return True
 
         # Fallback: some directories don't use canonical group classes.
         # Look up by name and infer group-likeness from objectClass/member attributes.
-        fallback_filter = (
-            "(|"
-            f"(cn={escaped})"
-            f"(sAMAccountName={escaped})"
-            f"(name={escaped})"
-            f"(gidNumber={escaped})"
-            ")"
-        )
+        fallback_filter = name_filter
         return self._search_group_like(fallback_filter)
 
     def _search_one(self, filter_expr: str) -> bool:
