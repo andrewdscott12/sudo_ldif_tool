@@ -319,7 +319,6 @@ class LdapIdentityValidator:
                 "(&(|"
                 "(objectClass=user)"
                 "(objectClass=person)"
-                "(objectClass=inetOrgPerson)"
                 "(objectClass=posixAccount)"
                 f")({attr}={escaped}))"
             )
@@ -356,8 +355,6 @@ class LdapIdentityValidator:
             "(objectCategory=group)"  # Active Directory canonical group category
             "(objectClass=group)"  # Active Directory group object class
             "(objectClass=posixGroup)"
-            "(objectClass=groupOfNames)"
-            "(objectClass=groupOfUniqueNames)"
             ")"
             f"{name_filter}"
             ")"
