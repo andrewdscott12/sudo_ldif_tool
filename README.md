@@ -2,6 +2,11 @@
 
 Convert CSV sudo policy reports into consolidated LDAP `sudoRole` LDIF entries.
 
+This repository now includes two scripts:
+
+- `sudo_to_ldif.py`: converts CSV report data into LDIF
+- `sudo_ldif_validator.py`: validates generated LDIF entries
+
 ## What This Script Does
 
 The script ingests rows in this preferred form:
@@ -143,3 +148,50 @@ The parser translates these into LDAP-style `sudoOption` values:
     - `hostname,user|group,subject_name,policyfile:policy_line`
 - Delimiter must be a comma `,`.
 - Output DNs use `cn=<role_name>,<base_dn>`.
+
+## LDIF Validator
+
+Use `sudo_ldif_validator.py` to validate existing sudoRole LDIF entries before import.
+
+### What it validates
+
+- `sudoUser`
+  - LDAP lookup against users and groups
+  - Supports values like `%group`, `!user`, `ALL`, `+netgroup`, and numeric `#id`
+  - Lookup results are cached locally during a run for speed
+- `sudoCommand`
+  - Absolute paths must exist and be executable
+  - Relative commands must resolve on `PATH`
+  - Supports command globs and digest-prefixed forms
+- `sudoOption`
+  - Syntax validation for LDAP-style sudo options (`option`, `!option`, `option=value`)
+  - Option-name validation against known sudo LDAP option names
+
+### Validator CLI usage
+
+```bash
+python3 sudo_ldif_validator.py INPUT_LDIF [options]
+```
+
+### Validator options
+
+- `--ldap-uri <uri>`
+- `--ldap-bind-dn <bind_dn>`
+- `--ldap-bind-password <password>`
+- `--ldap-search-base <search_base>`
+- `--ldap-user-attr <attr>`
+- `--strict-options` (treat unknown option names as errors)
+
+### Validator example
+
+```bash
+python3 sudo_ldif_validator.py output.ldif \
+  --ldap-uri "ldaps://dc01.corp.local" \
+  --ldap-bind-dn "cn=ldap-reader,ou=Service Accounts,dc=corp,dc=local" \
+  --ldap-bind-password "REDACTED" \
+  --ldap-search-base "dc=corp,dc=local" \
+  --ldap-user-attr "sAMAccountName" \
+  --strict-options
+```
+
+The validator prints PASS/FAIL per `sudoRole` and exits non-zero if any errors are found.
