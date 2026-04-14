@@ -249,14 +249,34 @@ class LdapIdentityValidator:
 
     def _group_exists(self, group_name: str) -> bool:
         escaped = ldap_filter_escape(group_name)
-        filter_expr = (
-            "(&(|(objectClass=group)(objectClass=posixGroup))(|"
+        strict_filter = (
+            "(&(|"
+            "(objectCategory=group)"  # Active Directory canonical group category
+            "(objectClass=group)"  # Active Directory group object class
+            "(objectClass=posixGroup)"
+            "(objectClass=groupOfNames)"
+            "(objectClass=groupOfUniqueNames)"
+            ")(|"
             f"(cn={escaped})"
             f"(sAMAccountName={escaped})"
+            f"(name={escaped})"  # Active Directory display/name attribute
             f"(gidNumber={escaped})"
             "))"
         )
-        return self._search_one(filter_expr)
+        if self._search_one(strict_filter):
+            return True
+
+        # Fallback: some directories don't use canonical group classes.
+        # Look up by name and infer group-likeness from objectClass/member attributes.
+        fallback_filter = (
+            "(|"
+            f"(cn={escaped})"
+            f"(sAMAccountName={escaped})"
+            f"(name={escaped})"
+            f"(gidNumber={escaped})"
+            ")"
+        )
+        return self._search_group_like(fallback_filter)
 
     def _search_one(self, filter_expr: str) -> bool:
         assert self._conn is not None
@@ -267,6 +287,39 @@ class LdapIdentityValidator:
             size_limit=1,
         )
         return bool(self._conn.entries)
+
+    def _search_group_like(self, filter_expr: str) -> bool:
+        assert self._conn is not None
+        self._conn.search(
+            search_base=self._search_base,
+            search_filter=filter_expr,
+            attributes=["objectClass", "member", "memberUid", "uniqueMember", "gidNumber"],
+            size_limit=5,
+        )
+
+        for entry in self._conn.entries:
+            object_classes = [str(v).lower() for v in getattr(entry, "objectClass").values] if hasattr(entry, "objectClass") else []
+
+            if any("group" in cls for cls in object_classes):
+                return True
+
+            if self._entry_has_values(entry, "member"):
+                return True
+            if self._entry_has_values(entry, "memberUid"):
+                return True
+            if self._entry_has_values(entry, "uniqueMember"):
+                return True
+            if self._entry_has_values(entry, "gidNumber"):
+                return True
+
+        return False
+
+    @staticmethod
+    def _entry_has_values(entry: Any, attr_name: str) -> bool:
+        if not hasattr(entry, attr_name):
+            return False
+        values = getattr(entry, attr_name).values
+        return bool(values)
 
 
 def parse_args() -> argparse.Namespace:
