@@ -203,11 +203,20 @@ def normalize_csv_row(raw: List[str]) -> Optional[Tuple[str, str, str, str, str]
         return None
 
     lower = row_text.lower()
-    if lower.startswith("hostname,user|group"):
+    if lower.startswith("hostname,user|group") or lower.startswith("hostname,policyfile"):
         return None
 
     if len(raw) >= 5:
-        hostname, subject_type, subject_name, policyfile = raw[0:4]
+        # Supported 5-column layouts:
+        # 1) hostname,user|group,subject_name,policyfile,policy_line
+        # 2) hostname,policyfile,user|group,subject_name,policy_line
+        c1, c2, c3, c4 = raw[0:4]
+        if c2.strip().lower() in {"user", "group"}:
+            hostname, subject_type, subject_name, policyfile = c1, c2, c3, c4
+        elif c3.strip().lower() in {"user", "group"} and _looks_like_policy_path(c2):
+            hostname, policyfile, subject_type, subject_name = c1, c2, c3, c4
+        else:
+            return None
         policy_line = ",".join(raw[4:])
     elif len(raw) == 4:
         hostname, subject_type, subject_name, policy_blob = raw
@@ -231,6 +240,13 @@ def normalize_csv_row(raw: List[str]) -> Optional[Tuple[str, str, str, str, str]
         return None
 
     return hostname, subject_type, subject_name, policyfile, policy_line
+
+
+def _looks_like_policy_path(value: str) -> bool:
+    candidate = value.strip().lower()
+    if not candidate:
+        return False
+    return candidate.startswith("/") or "sudoers" in candidate
 
 
 def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
@@ -369,9 +385,15 @@ def _classify_invalid_row(raw_row: List[str]) -> str:
     if len(raw_row) > 5:
         return f"more than 5 columns ({len(raw_row)}); policy text may be misquoted"
 
+    if len(raw_row) >= 3:
+        c2 = raw_row[1].strip().lower()
+        c3 = raw_row[2].strip().lower()
+        if c2 not in {"user", "group"} and c3 not in {"user", "group"}:
+            return "missing user/group marker; expected in column 2 or 3"
+
     subject_type = raw_row[1].strip().lower() if len(raw_row) > 1 else ""
     if subject_type not in {"user", "group"}:
-        return "column 2 must be 'user' or 'group'"
+        return "column 2 must be 'user'/'group' (old layout) or column 3 (path-first layout)"
 
     return "missing required value(s)"
 
@@ -383,13 +405,15 @@ def _build_csv_format_error_message(source_csv: Path, diagnostics: CsvParseDiagn
 
     expected = [
         "Expected CSV format:",
-        "  5-column form:",
+        "  5-column form (legacy):",
         "    hostname,user|group,subject_name,policyfile,policy_line",
+        "  5-column form (path-first):",
+        "    hostname,policyfile,user|group,subject_name,policy_line",
         "  4-column form:",
         "    hostname,user|group,subject_name,policyfile:policy_line",
         "  Notes:",
         "    - Delimiter must be a comma ','",
-        "    - Column 2 must be exactly 'user' or 'group'",
+        "    - user|group marker is required (column 2 for legacy, column 3 for path-first)",
         "    - Header rows and lines starting with '###' are ignored",
     ]
 
@@ -502,13 +526,15 @@ def build_policy_map(
         _merge_record_into_aggregate(policies[cn_base], record, resolver)
 
     # /etc/sudoers: shared signatures are consolidated together.
-    # One-off signatures are grouped into SUDO_suders_<hostname>.
+    # One-off signatures are grouped into SUDO_<filename>_<hostname>.
     for record in sudoers_records:
+        file_key = _policy_file_key(record.policyfile)
+        source_token = sanitize_cn_component(file_key)
         sig_hosts = sudoers_signature_hosts[_record_signature(record)]
         if len(sig_hosts) == 1:
-            cn_base = f"SUDO_suders_{sanitize_cn_component(record.hostname)}"
+            cn_base = f"SUDO_{source_token}_{sanitize_cn_component(record.hostname)}"
         else:
-            cn_base = "SUDO_sudoers"
+            cn_base = f"SUDO_{source_token}"
 
         if cn_base not in policies:
             policies[cn_base] = _new_aggregate(cn_base)

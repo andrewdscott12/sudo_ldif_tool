@@ -4,9 +4,13 @@ Convert CSV sudo policy reports into consolidated LDAP `sudoRole` LDIF entries.
 
 ## What This Script Does
 
-The script ingests rows like:
+The script ingests rows in this preferred form:
 
-`hostname,user|group,username|groupname,policyfile,sudo policy line`
+`hostname,policyfile,user|group,username|groupname,sudo policy line`
+
+Example:
+
+`app01,/etc/sudoers.d/unixadmins,user,bob,bob ALL=(root) /usr/bin/systemctl`
 
 Then it:
 
@@ -37,11 +41,11 @@ All matching rows for that file are merged into one role containing:
 
 - Shared signatures appearing on multiple hosts are consolidated into `SUDO_sudoers`
 - One-off signatures found on only one host are emitted as:
-  - `SUDO_suders_<hostname>`
+  - `SUDO_sudoers_<hostname>`
 
 Example:
 
-- one-off on `app01` -> `SUDO_suders_app01`
+- one-off on `app01` -> `SUDO_sudoers_app01`
 
 ## Active Directory Group Expansion
 
@@ -130,5 +134,12 @@ The parser translates these into LDAP-style `sudoOption` values:
 
 - Lines beginning with `###` are ignored.
 - Header lines are ignored.
-- 4-column and 5-column report variants are supported.
+- Supported CSV input layouts:
+  - Preferred 5-column (path-first):
+    - `hostname,policyfile,user|group,subject_name,policy_line`
+  - Legacy 5-column:
+    - `hostname,user|group,subject_name,policyfile,policy_line`
+  - Legacy 4-column:
+    - `hostname,user|group,subject_name,policyfile:policy_line`
+- Delimiter must be a comma `,`.
 - Output DNs use `cn=<role_name>,<base_dn>`.
