@@ -267,6 +267,21 @@ def normalize_csv_row(raw: List[str]) -> Optional[Tuple[str, str, str, str, str]
             return None
         policy_line = ",".join(raw[4:])
     elif len(raw) == 4:
+        # Some wrapped Defaults lines can be shifted into a 4-column shape like:
+        # hostname,/etc/sudoers.d/policy/group,Defaults:%grp,!requiretty
+        c1, c2, c3, c4 = raw
+        if _looks_like_policy_path(c2) and c3.strip().lower().startswith("defaults:"):
+            hostname = c1.strip()
+            policyfile, suffix_subject_type = _split_policyfile_subject_type(c2)
+            subject_type = suffix_subject_type
+            subject_name = c3.split(":", 1)[1].strip().lstrip("%") or "unknown"
+            policy_line = f"{c3} {c4}".strip()
+
+            if not (hostname and policyfile and subject_type and subject_name and policy_line):
+                return None
+
+            return hostname, subject_type, subject_name, policyfile, policy_line
+
         hostname, subject_type, subject_name, policy_blob = raw
         if ":" in policy_blob:
             policyfile, policy_line = policy_blob.split(":", 1)
@@ -297,10 +312,27 @@ def _looks_like_policy_path(value: str) -> bool:
     return candidate.startswith("/") or "sudoers" in candidate
 
 
+def _split_policyfile_subject_type(policyfile_raw: str) -> Tuple[str, str]:
+    candidate = policyfile_raw.strip()
+    suffix_match = re.match(r"^(?P<path>.+?)/(?P<stype>user|group)$", candidate, flags=re.IGNORECASE)
+    if not suffix_match:
+        return candidate, "group"
+    return suffix_match.group("path").strip(), suffix_match.group("stype").lower()
+
+
 def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
     cleaned = " ".join(policy_line.strip().split())
     if not cleaned:
         return ParsedRule("ALL", tuple(), tuple(["ALL"]), tuple())
+
+    if cleaned.lower().startswith("defaults"):
+        defaults_options = {translate_sudo_option(t) for t in _parse_defaults_options(cleaned)}
+        if "!requiretty" in defaults_options:
+            defaults_options.discard("requiretty")
+        if "!authenticate" in defaults_options:
+            defaults_options.discard("authenticate")
+        # Defaults lines carry options rather than explicit command grants.
+        return ParsedRule("ALL", tuple(), tuple(), tuple(sorted(defaults_options)))
 
     # Support both forms:
     # 1) <who> <hostspec>=(<runas>) <cmdspec>
@@ -448,6 +480,22 @@ def _extract_leading_option_token(text: str) -> Tuple[Optional[str], str]:
     return None, text
 
 
+def _parse_defaults_options(cleaned_defaults: str) -> List[str]:
+    # Examples:
+    # Defaults:%group !requiretty,env_reset
+    # Defaults !authenticate
+    parts = cleaned_defaults.split(None, 1)
+    if len(parts) < 2:
+        return []
+
+    option_blob = parts[1].strip()
+    # Drop selector prefix like %group / :user / @host if present.
+    option_blob = re.sub(r"^[^\s]+\s+", "", option_blob)
+
+    tokens = [t.strip() for t in option_blob.split(",") if t.strip()]
+    return [token for token in tokens if _looks_like_option_token(token)]
+
+
 def _looks_like_option_token(token: str) -> bool:
     cleaned = token.strip()
     if not cleaned:
@@ -493,6 +541,15 @@ class PolicyRecord:
     subject_name: str
     policyfile: str
     parsed: ParsedRule
+
+
+@dataclass
+class PendingPolicyRecord:
+    hostname: str
+    subject_type: str
+    subject_name: str
+    policyfile: str
+    policy_line: str
 
 
 @dataclass
@@ -581,16 +638,45 @@ def _build_csv_format_error_message(source_csv: Path, diagnostics: CsvParseDiagn
 def build_policy_records(source_csv: Path) -> List[PolicyRecord]:
     records: List[PolicyRecord] = []
     diagnostics = CsvParseDiagnostics()
+    pending: Optional[PendingPolicyRecord] = None
+
+    def flush_pending() -> None:
+        nonlocal pending
+        if not pending:
+            return
+
+        parsed_pending = parse_sudo_policy_line(_finalize_policy_line(pending.policy_line))
+        records.append(
+            PolicyRecord(
+                hostname=pending.hostname,
+                subject_type=pending.subject_type,
+                subject_name=pending.subject_name,
+                policyfile=pending.policyfile,
+                parsed=parsed_pending,
+            )
+        )
+        pending = None
 
     with source_csv.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.reader(handle)
         for raw_row in reader:
             diagnostics.total_rows += 1
+
+            if pending and _is_policy_continuation_row(raw_row, pending):
+                fragment = _extract_policy_continuation_fragment(raw_row)
+                pending.policy_line = _append_policy_continuation(pending.policy_line, fragment)
+                if not _line_continues(pending.policy_line):
+                    flush_pending()
+                continue
+
+            if pending and not _is_policy_continuation_row(raw_row, pending):
+                flush_pending()
+
             normalized = normalize_csv_row(raw_row)
             if not normalized:
                 row_text = ",".join(raw_row).strip()
                 lower = row_text.lower()
-                if (not row_text) or row_text.startswith("###") or lower.startswith("hostname,user|group"):
+                if (not row_text) or row_text.startswith("###") or lower.startswith("hostname,user|group") or lower.startswith("hostname,policyfile"):
                     diagnostics.skipped_rows += 1
                     continue
 
@@ -602,7 +688,17 @@ def build_policy_records(source_csv: Path) -> List[PolicyRecord]:
                 continue
 
             hostname, subject_type, subject_name, policyfile, policy_line = normalized
-            parsed = parse_sudo_policy_line(policy_line)
+            if _line_continues(policy_line):
+                pending = PendingPolicyRecord(
+                    hostname=hostname,
+                    subject_type=subject_type,
+                    subject_name=subject_name,
+                    policyfile=policyfile,
+                    policy_line=policy_line,
+                )
+                continue
+
+            parsed = parse_sudo_policy_line(_finalize_policy_line(policy_line))
             records.append(
                 PolicyRecord(
                     hostname=hostname,
@@ -613,10 +709,58 @@ def build_policy_records(source_csv: Path) -> List[PolicyRecord]:
                 )
             )
 
+    if pending:
+        flush_pending()
+
     if not records and diagnostics.invalid_rows:
         raise ValueError(_build_csv_format_error_message(source_csv, diagnostics))
 
     return records
+
+
+def _line_continues(policy_line: str) -> bool:
+    return policy_line.strip().endswith("\\")
+
+
+def _is_policy_continuation_row(raw_row: List[str], pending: PendingPolicyRecord) -> bool:
+    if len(raw_row) < 4:
+        return False
+
+    if raw_row[1].strip() != pending.policyfile:
+        return False
+
+    continuation_candidate = raw_row[3].strip()
+    if not continuation_candidate:
+        return False
+
+    # Continuation rows for wrapped command lists typically put command fragments
+    # in the subject-name slot (e.g. /bin/true, or /sbin/ifconfig,).
+    return continuation_candidate.startswith("/") or continuation_candidate.startswith("!/")
+
+
+def _extract_policy_continuation_fragment(raw_row: List[str]) -> str:
+    return ",".join(raw_row[3:]).strip()
+
+
+def _append_policy_continuation(base_line: str, fragment: str) -> str:
+    base = base_line.strip()
+    frag = fragment.strip()
+    if base.endswith("\\"):
+        base = base[:-1].rstrip()
+    if not base:
+        return frag
+    if not frag:
+        return base
+
+    # Wrapped command lists are usually comma-separated in the original sudoers file.
+    # Use a comma separator when stitching so each command remains distinct.
+    if base.endswith((":", ",")) or frag.startswith(","):
+        return f"{base} {frag}".strip()
+    return f"{base}, {frag}".strip()
+
+
+def _finalize_policy_line(policy_line: str) -> str:
+    return policy_line.replace("\\", " ").strip()
 
 
 def _policy_file_key(policyfile: str) -> str:
