@@ -27,7 +27,9 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 SUDO_BASE_DN = "ou=SUDOers,dc=example,dc=com"
 
 DEFAULT_HOST_ALL_THRESHOLD = 25
-USER_NAME_ATTRS = ("uid", "sAMAccountName", "cn")
+
+# Active Directory configuration: user attributes to try for username extraction (in order of preference)
+USER_NAME_ATTRS = ("sAMAccountName", "cn", "uid")
 
 KNOWN_LDAP_OPTION_NAMES = {
     "authenticate",
@@ -143,7 +145,7 @@ class LdapGroupResolver:
             return set(self._group_cache[group_name])
 
         escaped = ldap_filter_escape(group_name)
-        # Active Directory group lookup by name.
+        # Search for Active Directory groups by cn or sAMAccountName
         filter_expr = f"(&(objectClass=group)(|(cn={escaped})(sAMAccountName={escaped})))"
 
         assert self._conn is not None
@@ -161,15 +163,14 @@ class LdapGroupResolver:
         entry = self._conn.entries[0]
         members: Set[str] = set()
 
-        # AD stores group members as user DNs in `member`.
-        dns: List[str] = []
+        # Active Directory uses DN-based membership in the 'member' attribute
         if hasattr(entry, "member") and entry.member:
-            dns.extend(str(v).strip() for v in entry.member.values if str(v).strip())
-
-        for dn in dns:
-            user_value = self._resolve_user_dn(dn)
-            if user_value:
-                members.add(user_value)
+            member_dns = [str(v).strip() for v in entry.member.values if str(v).strip()]
+            
+            for dn in member_dns:
+                user_value = self._resolve_user_dn(dn)
+                if user_value:
+                    members.add(user_value)
 
         self._group_cache[group_name] = members
         return set(members)
@@ -325,65 +326,23 @@ def parse_sudo_policy_line(policy_line: str) -> ParsedRule:
     if not cleaned:
         return ParsedRule("ALL", tuple(), tuple(["ALL"]), tuple())
 
-    if cleaned.lower().startswith("defaults"):
-        defaults_options = {translate_sudo_option(t) for t in _parse_defaults_options(cleaned)}
-        if "!requiretty" in defaults_options:
-            defaults_options.discard("requiretty")
-        if "!authenticate" in defaults_options:
-            defaults_options.discard("authenticate")
-        # Defaults lines carry options rather than explicit command grants.
-        return ParsedRule("ALL", tuple(), tuple(), tuple(sorted(defaults_options)))
+    # Strip subject prefix if present (e.g., "root" or "%groupname")
+    # This handles cases where the CSV policy line includes the subject
+    strip_match = re.match(r"^[%]?\S+\s+(.+)$", cleaned)
+    if strip_match:
+        cleaned = strip_match.group(1)
 
-    # Support both forms:
-    # 1) <who> <hostspec>=(<runas>) <cmdspec>
-    # 2) <who> <hostspec>=<cmdspec> (no explicit runas)
-    match = re.match(
-        r"^(?P<who>\S+)\s+(?P<host>\S+)\s*=\s*(?:\((?P<runas>[^)]*)\)\s*)?(?P<cmd>.+)$",
-        cleaned,
-    )
-    if match:
-        host_spec = match.group("host").strip()
-        runas_raw = (match.group("runas") or "").strip()
-        cmdspec = match.group("cmd").strip()
-    else:
-        # Also support compact forms seen in exports, e.g.:
-        # ALL(ALL) NOPASSWD: /bin/bash
-        # ALL(root) /bin/systemctl
-        compact = re.match(
-            r"^(?P<host>\S+)\s*\((?P<runas>[^)]*)\)\s*(?P<cmd>.+)$",
-            cleaned,
-        )
-        host_eq = re.match(
-            r"^(?P<host>\S+)\s*=\s*(?:\((?P<runas>[^)]*)\)\s*)?(?P<cmd>.+)$",
-            cleaned,
-        )
-        if compact:
-            host_spec = compact.group("host").strip()
-            runas_raw = (compact.group("runas") or "").strip()
-            cmdspec = compact.group("cmd").strip()
-        elif host_eq:
-            host_spec = host_eq.group("host").strip()
-            runas_raw = (host_eq.group("runas") or "").strip()
-            cmdspec = host_eq.group("cmd").strip()
-        else:
-            # Before treating the whole string as a bare command, check whether it
-            # is really a standalone option token (e.g. "!requiretty", "NOPASSWD:").
-            # This happens when a CSV row contains only an option spec with no
-            # host/runas structure – the token should become a sudoOption, not a
-            # sudoCommand.
-            parts = _split_csvish_values(cleaned)
-            opt_parts = [t.rstrip(":") for t in parts if t]
-            if opt_parts and all(_looks_like_option_token(t) for t in opt_parts):
-                translated = {translate_sudo_option(t) for t in opt_parts if t}
-                return ParsedRule("ALL", tuple(), tuple(), tuple(sorted(translated)))
-            # Fall back to preserving entire token stream as a single command.
-            return ParsedRule("ALL", tuple(), tuple([cleaned]), tuple())
+    # Expected format: "<hostspec>=(<runas>) <cmdspec>"
+    match = re.match(r"^(?P<host>\S+)\s*=\s*\((?P<runas>[^)]*)\)\s*(?P<cmd>.+)$", cleaned)
+    if not match:
+        # Fall back to preserving entire token stream as a single command.
+        return ParsedRule("ALL", tuple(), tuple([cleaned]), tuple())
 
-    runas_users = (
-        tuple(sorted({_normalize_runas_value(v) for v in _split_csvish_values(runas_raw)}))
-        if runas_raw
-        else tuple()
-    )
+    host_spec = match.group("host").strip()
+    runas_raw = match.group("runas").strip()
+    cmdspec = match.group("cmd").strip()
+
+    runas_users = tuple(sorted(_split_csvish_values(runas_raw))) if runas_raw else tuple()
     command_parts = _split_csvish_values(cmdspec)
 
     option_tokens: List[str] = []
@@ -898,7 +857,7 @@ def build_ldif_entries(
         lines.append("objectClass: sudoRole")
         lines.append(f"cn: {cn}")
 
-        for user in sorted(agg.sudo_users):
+        for user in sorted(sudo_users):
             lines.append(f"sudoUser: {user.lower()}")
 
         for host in sudo_hosts:
