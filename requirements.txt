@@ -1,3 +1,4 @@
 # Python package dependencies
 # Add packages as needed
 ldap3>=2.9
+pytest>=8.0
